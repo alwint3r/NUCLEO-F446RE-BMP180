@@ -43,6 +43,11 @@ typedef struct bmp180_cal_struct {
 	int16_t mc;
 	int16_t md;
 } bmp180_cal_t;
+
+typedef struct bmp180_data_struct {
+  long temperature;
+  long pressure;
+} bmp180_data_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -85,7 +90,9 @@ HAL_StatusTypeDef BMP180_ReadInt16(uint8_t address, int16_t *result);
 HAL_StatusTypeDef BMP180_Write(uint8_t* data, size_t length);
 HAL_StatusTypeDef BMP180_ReadByte(uint8_t address, uint8_t *result);
 HAL_StatusTypeDef BMP180_Read_Calibration();
-HAL_StatusTypeDef BMP180_Read_Temperature(float *result);
+uint32_t BMP180_Get_Pressure_Measurement_Time(uint8_t oversampling);
+HAL_StatusTypeDef BMP180_Acquire_Data(uint8_t oversampling, bmp180_data_t* result);
+unsigned long BMP180_Absolute_Altitude(float pressure, float seaLevelPressure);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -101,7 +108,7 @@ int main(void)
 {
   /* USER CODE BEGIN 1 */
   uint8_t pbuf[128];
-  float temperature;
+  bmp180_data_t data;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -143,16 +150,30 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    ret = BMP180_Read_Temperature(&temperature);
+    ret = BMP180_Acquire_Data(3, &data);
     if (ret != HAL_OK)
     {
       sprintf((char*)pbuf, "Failed reading temperature!\r\n");
     }
     else
     {
-      unsigned int temp = (unsigned int)temperature / 10;
-      unsigned int dec = (unsigned int)temperature % 10;
-      sprintf((char*)pbuf, "Temperature: %u.%02u C\r\n", temp, dec);
+      unsigned int temp = (unsigned int)data.temperature / 10;
+      unsigned int dec = (unsigned int)data.temperature % 10;
+      unsigned int press = (unsigned int)data.pressure / 100;
+      unsigned int pressdec = (unsigned int)data.pressure % 100;
+
+//      unsigned long altcm = BMP180_Absolute_Altitude(data.pressure / 100.0f, 1013.25);
+      unsigned long altcm = BMP180_Absolute_Altitude(data.pressure / 100.0f, 1012.0);
+      unsigned int alt = (unsigned int)altcm / 100;
+      unsigned int altdec = (unsigned int)altcm % 100;
+      sprintf((char*)pbuf, "Temperature: %u.%02u C\t Pressure: %u.%02u hPa\t Abs. Altitude: %u.%02u m\r\n",
+          temp,
+          dec,
+          press,
+          pressdec,
+          alt,
+          altdec
+      );
     }
 
     HAL_UART_Transmit(&huart2, pbuf, strlen((char*)pbuf), HAL_MAX_DELAY);
@@ -442,11 +463,13 @@ HAL_StatusTypeDef BMP180_Read_Calibration()
   return HAL_OK;
 }
 
-HAL_StatusTypeDef BMP180_Read_Temperature(float *result)
+HAL_StatusTypeDef BMP180_Acquire_Data(uint8_t oversampling, bmp180_data_t* result)
 {
-  uint8_t buf[2];
+  uint8_t buf[3];
   HAL_StatusTypeDef ret;
+  uint8_t oss = oversampling > 3 ? 3 : oversampling;
 
+  // read temperature;
   buf[0] = 0xF4;
   buf[1] = 0x2E;
   ret = BMP180_Write(buf, 2);
@@ -469,9 +492,90 @@ HAL_StatusTypeDef BMP180_Read_Temperature(float *result)
   long b5 = x1 + x2;
   long temp = (b5 + 8) / pow(2, 4);
 
-  *result = (float)temp;
+  result->temperature = temp;
+
+  // read pressure
+  buf[0] = 0xF4;
+  buf[1] = (0x34 + (oss << 6));
+  ret = BMP180_Write(buf, 2);
+  if (ret != HAL_OK)
+  {
+    return ret;
+  }
+
+  HAL_Delay(BMP180_Get_Pressure_Measurement_Time(oversampling));
+
+  uint8_t pmsb, plsb, pxlsb;
+  ret = BMP180_ReadByte(0xF6, &pmsb);
+  if (ret != HAL_OK)
+  {
+    return ret;
+  }
+
+  ret = BMP180_ReadByte(0xF7, &plsb);
+  if (ret != HAL_OK)
+  {
+    return ret;
+  }
+
+  ret = BMP180_ReadByte(0xF8, &pxlsb);
+  if (ret != HAL_OK)
+  {
+    return ret;
+  }
+
+  long upressure = (pmsb << 16 | plsb << 8 | pxlsb) >> (8 - oss);
+  long b6 = b5 - 4000;
+  x1 = (cal.ac2 * ((b6 * b6) >> 12)) >> 11;
+  x2 = (cal.ac2 * b6) >> 11;
+  long x3 = x1 + x2;
+  long b3 = (((cal.ac1 * 4 + x3) << oss) + 2) / 4;
+  x1 = (cal.ac3 * b6) >> 13;
+  x2 = (cal.b1 * ((b6 * b6) >> 12)) >> 16;
+  x3 = ((x1 + x2) + 2) / 4;
+  unsigned long b4 = cal.ac4 * (unsigned long)(x3 + 32768) / pow(2, 15);
+  unsigned long b7 = ((unsigned long)upressure - b3) * (50000 >> oss);
+  long p = (b7 < 0x80000000) ? ((b7 * 2) / b4) : ((b7 / b4) * 2);
+
+  x1 = (p >> 8) * (p >> 8);
+  x1 = (x1 * 3038) >> 16;
+  x2 = (-7357 * p) >> 16;
+  p = p + ((x1 + x2 + 3791) >> 4);
+
+  result->pressure = p;
 
   return HAL_OK;
+}
+
+uint32_t BMP180_Get_Pressure_Measurement_Time(uint8_t oversampling)
+{
+  uint8_t oss = oversampling > 3 ? 3 : oversampling;
+  uint32_t delayMs = 0;
+  switch (oss)
+  {
+  case 0:
+    delayMs = 5;
+  break;
+  case 1:
+    delayMs = 8;
+  break;
+  case 2:
+    delayMs = 14;
+  break;
+  case 3:
+    delayMs = 26;
+  break;
+  }
+
+  return delayMs;
+}
+
+unsigned long BMP180_Absolute_Altitude(float pressure, float seaLevelPressure)
+{
+  float ratio = pressure / seaLevelPressure;
+  float alt = 44330 * (1 - pow(ratio, (1.0/5.225)));
+
+  return (unsigned long)(alt * 100);
 }
 /* USER CODE END 4 */
 
